@@ -1,0 +1,3 @@
+[submodule "Primus-Turbo"]
+	path = Primus-Turbo
+	url = https://github.com/AMD-AGI/Primus-Turbo.git
