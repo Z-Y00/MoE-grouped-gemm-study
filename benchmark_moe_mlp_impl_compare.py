@@ -22,6 +22,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from torch.profiler import ProfilerActivity, profile
 
 
 @dataclass
@@ -32,6 +33,32 @@ class CaseConfig:
     m_tokens_per_expert: int
     hidden_size: int
     ffn_size: int
+
+
+def _maybe_compile_fwd(fn, enabled: bool):
+    if not enabled or not hasattr(torch, "compile"):
+        return fn
+    try:
+        # Primus custom ops may fail graph capture in some cases; keep benchmark robust.
+        compiled = torch.compile(fn, fullgraph=False, dynamic=False)
+    except Exception as e:
+        print(f"[WARN] torch.compile setup failed; using eager. reason={type(e).__name__}: {e}")
+        return fn
+
+    failed_once = False
+
+    def compiled_or_eager():
+        nonlocal failed_once
+        if failed_once:
+            return fn()
+        try:
+            return compiled()
+        except Exception as e:
+            failed_once = True
+            print(f"[WARN] torch.compile runtime failed; falling back to eager. reason={type(e).__name__}: {e}")
+            return fn()
+
+    return compiled_or_eager
 
 
 def _import_turbo_modules():
@@ -139,17 +166,25 @@ def run_one(
     warmup: int,
     iters: int,
     train: bool,
+    torch_compile_fwd: bool,
     swiglu_fwd_flops: float,
     swiglu_bwd_flops: float,
 ):
     x, w1, w2, group_lens = alloc_inputs(case, dtype, device, train=train)
 
     if impl_name == "grouped":
-        fn = lambda: moe_mlp_grouped(turbo, x, w1, w2, group_lens)
+        def impl_fn():
+            return moe_mlp_grouped(turbo, x, w1, w2, group_lens)
     elif impl_name == "expert_loop":
-        fn = lambda: moe_mlp_expert_loop(x, w1, w2, group_lens)
+        def impl_fn():
+            return moe_mlp_expert_loop(x, w1, w2, group_lens)
     else:
         raise ValueError(f"Unsupported impl_name: {impl_name}")
+
+    fn = impl_fn
+    # Compile forward path only; backward benchmarking keeps eager behavior.
+    if not train:
+        fn = _maybe_compile_fwd(impl_fn, enabled=torch_compile_fwd)
 
     if train:
         out_init = fn()
@@ -188,6 +223,47 @@ def run_one(
     return avg_ms, tflops
 
 
+def profile_one(
+    turbo,
+    case: CaseConfig,
+    impl_name: str,
+    device: int,
+    dtype: torch.dtype,
+    profile_steps: int,
+    torch_compile_fwd: bool,
+    row_limit: int,
+) -> str:
+    x, w1, w2, group_lens = alloc_inputs(case, dtype, device, train=False)
+
+    if impl_name == "grouped":
+        def impl_fn():
+            return moe_mlp_grouped(turbo, x, w1, w2, group_lens)
+    elif impl_name == "expert_loop":
+        def impl_fn():
+            return moe_mlp_expert_loop(x, w1, w2, group_lens)
+    else:
+        raise ValueError(f"Unsupported impl_name: {impl_name}")
+
+    fn = _maybe_compile_fwd(impl_fn, enabled=torch_compile_fwd)
+    # Warm once before profile to avoid one-time setup noise.
+    _ = fn()
+    torch.cuda.synchronize(device)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+    ) as prof:
+        for _ in range(profile_steps):
+            _ = fn()
+            torch.cuda.synchronize(device)
+            prof.step()
+
+    return prof.key_averages().table(
+        sort_by="self_cuda_time_total",
+        row_limit=row_limit,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark grouped vs expert-loop MoE MLP implementations")
     parser.add_argument("--device", type=int, default=0, help="CUDA/HIP device id.")
@@ -211,6 +287,19 @@ def main():
     parser.add_argument("--swiglu-fwd-flops-per-element", type=float, default=5.0)
     parser.add_argument("--swiglu-bwd-flops-per-element", type=float, default=8.0)
     parser.add_argument(
+        "--torch-compile-fwd",
+        dest="torch_compile_fwd",
+        action="store_true",
+        default=True,
+        help="Use torch.compile for forward benchmarks (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-torch-compile-fwd",
+        dest="torch_compile_fwd",
+        action="store_false",
+        help="Disable torch.compile for forward benchmarks.",
+    )
+    parser.add_argument(
         "--check-close",
         dest="check_close",
         action="store_true",
@@ -222,6 +311,26 @@ def main():
         dest="check_close",
         action="store_false",
         help="Disable grouped-vs-loop numerical closeness check.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help="Collect one-case torch profiler report for grouped and expert_loop.",
+    )
+    parser.add_argument(
+        "--profile-case-index",
+        type=int,
+        default=1,
+        help="1-based case index to profile when --profile is enabled.",
+    )
+    parser.add_argument("--profile-steps", type=int, default=20, help="Profiler iterations per impl.")
+    parser.add_argument("--profile-row-limit", type=int, default=20, help="Rows in profiler table output.")
+    parser.add_argument(
+        "--profile-output-prefix",
+        type=str,
+        default="",
+        help="Optional output prefix for profiler text files.",
     )
     args = parser.parse_args()
 
@@ -247,6 +356,7 @@ def main():
             warmup=args.warmup,
             iters=args.iters,
             train=train,
+            torch_compile_fwd=args.torch_compile_fwd,
             swiglu_fwd_flops=args.swiglu_fwd_flops_per_element,
             swiglu_bwd_flops=args.swiglu_bwd_flops_per_element,
         )
@@ -259,6 +369,7 @@ def main():
             warmup=args.warmup,
             iters=args.iters,
             train=train,
+            torch_compile_fwd=args.torch_compile_fwd,
             swiglu_fwd_flops=args.swiglu_fwd_flops_per_element,
             swiglu_bwd_flops=args.swiglu_bwd_flops_per_element,
         )
@@ -297,6 +408,40 @@ def main():
                 "allclose": close,
             }
         )
+
+        if args.profile and i == args.profile_case_index:
+            grouped_prof = profile_one(
+                turbo=turbo,
+                case=case,
+                impl_name="grouped",
+                device=args.device,
+                dtype=dtype,
+                profile_steps=args.profile_steps,
+                torch_compile_fwd=args.torch_compile_fwd,
+                row_limit=args.profile_row_limit,
+            )
+            loop_prof = profile_one(
+                turbo=turbo,
+                case=case,
+                impl_name="expert_loop",
+                device=args.device,
+                dtype=dtype,
+                profile_steps=args.profile_steps,
+                torch_compile_fwd=args.torch_compile_fwd,
+                row_limit=args.profile_row_limit,
+            )
+            print(f"\n[PROFILE] case={case.case} impl=grouped\n{grouped_prof}")
+            print(f"\n[PROFILE] case={case.case} impl=expert_loop\n{loop_prof}")
+
+            if args.profile_output_prefix:
+                grouped_path = f"{args.profile_output_prefix}.{case.case}.grouped.txt"
+                loop_path = f"{args.profile_output_prefix}.{case.case}.expert_loop.txt"
+                with open(grouped_path, "w", encoding="utf-8") as f:
+                    f.write(grouped_prof)
+                with open(loop_path, "w", encoding="utf-8") as f:
+                    f.write(loop_prof)
+                print(f"[PROFILE] Saved: {grouped_path}")
+                print(f"[PROFILE] Saved: {loop_path}")
 
     if args.csv:
         keys = [
