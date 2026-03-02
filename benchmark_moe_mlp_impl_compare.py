@@ -64,8 +64,6 @@ def _maybe_compile_fwd(fn, enabled: bool):
 def _import_turbo_modules():
     root = Path(__file__).resolve().parent
     turbo_root = root / "Primus-Turbo"
-    if str(turbo_root) not in sys.path:
-        sys.path.insert(0, str(turbo_root))
 
     ops_cfg_dir = turbo_root / "benchmark" / "ops"
     if str(ops_cfg_dir) not in sys.path:
@@ -145,6 +143,51 @@ def moe_mlp_expert_loop(x, w1, w2, group_lens):
     return torch.cat(out_chunks, dim=0)
 
 
+def moe_mlp_grouped_breakdown(turbo, x, w1, w2, group_lens, breakdown_parts: int):
+    b = group_lens.numel()
+    if breakdown_parts <= 0:
+        raise ValueError(f"breakdown_parts must be > 0, got {breakdown_parts}")
+    if breakdown_parts > b:
+        raise ValueError(f"breakdown_parts={breakdown_parts} exceeds num_experts={b}")
+
+    # Prefix sums let us slice x for arbitrary (possibly non-uniform) group_lens.
+    group_offs = torch.cumsum(group_lens, dim=0)
+    chunk_size = (b + breakdown_parts - 1) // breakdown_parts
+    out_chunks = []
+    for part in range(breakdown_parts):
+        e0 = part * chunk_size
+        e1 = min((part + 1) * chunk_size, b)
+        if e0 >= e1:
+            break
+        tok0 = 0 if e0 == 0 else int(group_offs[e0 - 1].item())
+        tok1 = int(group_offs[e1 - 1].item())
+
+        x_chunk = x[tok0:tok1]
+        w1_chunk = w1[e0:e1]
+        w2_chunk = w2[e0:e1]
+        lens_chunk = group_lens[e0:e1]
+
+        up = turbo.ops.grouped_gemm(x_chunk, w1_chunk, lens_chunk, trans_b=True)
+        u, v = up.chunk(2, dim=-1)
+        inter = F.silu(u) * v
+        out = turbo.ops.grouped_gemm(inter, w2_chunk, lens_chunk, trans_b=True)
+        out_chunks.append(out)
+    return torch.cat(out_chunks, dim=0)
+
+
+def _parse_breakdown_list(raw: str) -> list[int]:
+    values = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        value = int(part)
+        if value <= 0:
+            raise ValueError(f"Breakdown values must be > 0, got: {value}")
+        values.append(value)
+    return sorted(set(values))
+
+
 def _estimate_flops(case: CaseConfig, train: bool, swiglu_fwd_flops: float, swiglu_bwd_flops: float) -> float:
     b, m, h, f = case.b_local, case.m_tokens_per_expert, case.hidden_size, case.ffn_size
     gateup_fwd = 2.0 * b * m * h * (2 * f)
@@ -167,6 +210,7 @@ def run_one(
     iters: int,
     train: bool,
     torch_compile_fwd: bool,
+    breakdown_parts: int,
     swiglu_fwd_flops: float,
     swiglu_bwd_flops: float,
 ):
@@ -178,6 +222,9 @@ def run_one(
     elif impl_name == "expert_loop":
         def impl_fn():
             return moe_mlp_expert_loop(x, w1, w2, group_lens)
+    elif impl_name == "grouped_breakdown":
+        def impl_fn():
+            return moe_mlp_grouped_breakdown(turbo, x, w1, w2, group_lens, breakdown_parts=breakdown_parts)
     else:
         raise ValueError(f"Unsupported impl_name: {impl_name}")
 
@@ -231,6 +278,7 @@ def profile_one(
     dtype: torch.dtype,
     profile_steps: int,
     torch_compile_fwd: bool,
+    breakdown_parts: int,
     row_limit: int,
 ) -> str:
     x, w1, w2, group_lens = alloc_inputs(case, dtype, device, train=False)
@@ -241,6 +289,9 @@ def profile_one(
     elif impl_name == "expert_loop":
         def impl_fn():
             return moe_mlp_expert_loop(x, w1, w2, group_lens)
+    elif impl_name == "grouped_breakdown":
+        def impl_fn():
+            return moe_mlp_grouped_breakdown(turbo, x, w1, w2, group_lens, breakdown_parts=breakdown_parts)
     else:
         raise ValueError(f"Unsupported impl_name: {impl_name}")
 
@@ -286,6 +337,12 @@ def main():
     parser.add_argument("--csv", type=str, default="", help="Optional output CSV.")
     parser.add_argument("--swiglu-fwd-flops-per-element", type=float, default=5.0)
     parser.add_argument("--swiglu-bwd-flops-per-element", type=float, default=8.0)
+    parser.add_argument(
+        "--breakdown-list",
+        type=str,
+        default="1,2,4,8",
+        help="Comma-separated breakdown parts for grouped-breakdown impl (e.g. 1,2,4,8).",
+    )
     parser.add_argument(
         "--torch-compile-fwd",
         dest="torch_compile_fwd",
@@ -340,6 +397,7 @@ def main():
     bench_cfg, turbo = _import_turbo_modules()
     dtype = _dtype_from_name(args.dtype)
     train = args.mode == "train"
+    breakdown_list = _parse_breakdown_list(args.breakdown_list)
     cases = build_cases(bench_cfg, experts_mode=args.experts_mode)
     if args.max_cases > 0:
         cases = cases[: args.max_cases]
@@ -357,6 +415,7 @@ def main():
             iters=args.iters,
             train=train,
             torch_compile_fwd=args.torch_compile_fwd,
+            breakdown_parts=1,
             swiglu_fwd_flops=args.swiglu_fwd_flops_per_element,
             swiglu_bwd_flops=args.swiglu_bwd_flops_per_element,
         )
@@ -370,6 +429,7 @@ def main():
             iters=args.iters,
             train=train,
             torch_compile_fwd=args.torch_compile_fwd,
+            breakdown_parts=1,
             swiglu_fwd_flops=args.swiglu_fwd_flops_per_element,
             swiglu_bwd_flops=args.swiglu_bwd_flops_per_element,
         )
@@ -388,6 +448,36 @@ def main():
             f"grouped={grouped_tflops:.3f} TF/s, loop={loop_tflops:.3f} TF/s, "
             f"loop_over_grouped={speedup:.3f}, close={close}"
         )
+
+        for parts in breakdown_list:
+            if parts > case.b_local:
+                continue
+            bd_ms, bd_tflops = run_one(
+                turbo=turbo,
+                case=case,
+                impl_name="grouped_breakdown",
+                device=args.device,
+                dtype=dtype,
+                warmup=args.warmup,
+                iters=args.iters,
+                train=train,
+                torch_compile_fwd=args.torch_compile_fwd,
+                breakdown_parts=parts,
+                swiglu_fwd_flops=args.swiglu_fwd_flops_per_element,
+                swiglu_bwd_flops=args.swiglu_bwd_flops_per_element,
+            )
+            if args.check_close:
+                x, w1, w2, group_lens = alloc_inputs(case, dtype, args.device, train=False)
+                y_grouped = moe_mlp_grouped(turbo, x, w1, w2, group_lens)
+                y_bd = moe_mlp_grouped_breakdown(turbo, x, w1, w2, group_lens, breakdown_parts=parts)
+                bd_close = torch.allclose(y_grouped, y_bd, rtol=1e-2, atol=1e-2)
+            else:
+                bd_close = True
+            bd_over_grouped = bd_tflops / grouped_tflops if grouped_tflops > 0 else float("nan")
+            print(
+                f"      breakdown(parts={parts:>2})={bd_tflops:.3f} TF/s, "
+                f"over_grouped={bd_over_grouped:.3f}, close={bd_close}"
+            )
 
         rows.append(
             {
@@ -418,6 +508,7 @@ def main():
                 dtype=dtype,
                 profile_steps=args.profile_steps,
                 torch_compile_fwd=args.torch_compile_fwd,
+                breakdown_parts=1,
                 row_limit=args.profile_row_limit,
             )
             loop_prof = profile_one(
@@ -428,6 +519,7 @@ def main():
                 dtype=dtype,
                 profile_steps=args.profile_steps,
                 torch_compile_fwd=args.torch_compile_fwd,
+                breakdown_parts=1,
                 row_limit=args.profile_row_limit,
             )
             print(f"\n[PROFILE] case={case.case} impl=grouped\n{grouped_prof}")
