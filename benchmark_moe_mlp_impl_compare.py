@@ -280,6 +280,7 @@ def profile_one(
     torch_compile_fwd: bool,
     breakdown_parts: int,
     row_limit: int,
+    trace_json_path: str = "",
 ) -> str:
     x, w1, w2, group_lens = alloc_inputs(case, dtype, device, train=False)
 
@@ -308,6 +309,9 @@ def profile_one(
             _ = fn()
             torch.cuda.synchronize(device)
             prof.step()
+
+    if trace_json_path:
+        prof.export_chrome_trace(trace_json_path)
 
     return prof.key_averages().table(
         sort_by="self_cuda_time_total",
@@ -389,6 +393,12 @@ def main():
         default="",
         help="Optional output prefix for profiler text files.",
     )
+    parser.add_argument(
+        "--profile-json-prefix",
+        type=str,
+        default="",
+        help="Optional output prefix for profiler Chrome-trace JSON files.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -434,19 +444,62 @@ def main():
             swiglu_bwd_flops=args.swiglu_bwd_flops_per_element,
         )
 
+        y_grouped = None
         if args.check_close:
             x, w1, w2, group_lens = alloc_inputs(case, dtype, args.device, train=False)
             y_grouped = moe_mlp_grouped(turbo, x, w1, w2, group_lens)
-            y_loop = moe_mlp_expert_loop(x, w1, w2, group_lens)
-            close = torch.allclose(y_grouped, y_loop, rtol=1e-2, atol=1e-2)
-        else:
-            close = True
 
-        speedup = loop_tflops / grouped_tflops if grouped_tflops > 0 else float("nan")
+        if args.check_close:
+            y_loop = moe_mlp_expert_loop(x, w1, w2, group_lens)
+            loop_close = torch.allclose(y_grouped, y_loop, rtol=1e-2, atol=1e-2)
+        else:
+            loop_close = True
+
+        loop_over_grouped = loop_tflops / grouped_tflops if grouped_tflops > 0 else float("nan")
+        print(f"[{i:>3}/{len(cases)}] {case.case:<26}")
+        print(f"      grouped:      tflops={grouped_tflops:.3f}, avg_ms={grouped_ms:.3f}, close=True")
         print(
-            f"[{i:>3}/{len(cases)}] {case.case:<26} "
-            f"grouped={grouped_tflops:.3f} TF/s, loop={loop_tflops:.3f} TF/s, "
-            f"loop_over_grouped={speedup:.3f}, close={close}"
+            f"      expert_loop:  tflops={loop_tflops:.3f}, avg_ms={loop_ms:.3f}, "
+            f"over_grouped={loop_over_grouped:.3f}, close={loop_close}"
+        )
+
+        rows.append(
+            {
+                "timestamp_s": ts,
+                "mode": args.mode,
+                "case": case.case,
+                "model": case.model,
+                "B_local": case.b_local,
+                "M": case.m_tokens_per_expert,
+                "H": case.hidden_size,
+                "F": case.ffn_size,
+                "dtype": args.dtype,
+                "category": "grouped",
+                "breakdown_parts": 1,
+                "avg_ms": grouped_ms,
+                "tflops": grouped_tflops,
+                "over_grouped": 1.0,
+                "allclose_vs_grouped": True,
+            }
+        )
+        rows.append(
+            {
+                "timestamp_s": ts,
+                "mode": args.mode,
+                "case": case.case,
+                "model": case.model,
+                "B_local": case.b_local,
+                "M": case.m_tokens_per_expert,
+                "H": case.hidden_size,
+                "F": case.ffn_size,
+                "dtype": args.dtype,
+                "category": "expert_loop",
+                "breakdown_parts": 1,
+                "avg_ms": loop_ms,
+                "tflops": loop_tflops,
+                "over_grouped": loop_over_grouped,
+                "allclose_vs_grouped": loop_close,
+            }
         )
 
         for parts in breakdown_list:
@@ -467,37 +520,35 @@ def main():
                 swiglu_bwd_flops=args.swiglu_bwd_flops_per_element,
             )
             if args.check_close:
-                x, w1, w2, group_lens = alloc_inputs(case, dtype, args.device, train=False)
-                y_grouped = moe_mlp_grouped(turbo, x, w1, w2, group_lens)
                 y_bd = moe_mlp_grouped_breakdown(turbo, x, w1, w2, group_lens, breakdown_parts=parts)
                 bd_close = torch.allclose(y_grouped, y_bd, rtol=1e-2, atol=1e-2)
             else:
                 bd_close = True
             bd_over_grouped = bd_tflops / grouped_tflops if grouped_tflops > 0 else float("nan")
             print(
-                f"      breakdown(parts={parts:>2})={bd_tflops:.3f} TF/s, "
+                f"      grouped_breakdown(parts={parts:>2}): "
+                f"tflops={bd_tflops:.3f}, avg_ms={bd_ms:.3f}, "
                 f"over_grouped={bd_over_grouped:.3f}, close={bd_close}"
             )
-
-        rows.append(
-            {
-                "timestamp_s": ts,
-                "mode": args.mode,
-                "case": case.case,
-                "model": case.model,
-                "B_local": case.b_local,
-                "M": case.m_tokens_per_expert,
-                "H": case.hidden_size,
-                "F": case.ffn_size,
-                "dtype": args.dtype,
-                "grouped_avg_ms": grouped_ms,
-                "grouped_tflops": grouped_tflops,
-                "loop_avg_ms": loop_ms,
-                "loop_tflops": loop_tflops,
-                "speedup_loop_over_grouped": speedup,
-                "allclose": close,
-            }
-        )
+            rows.append(
+                {
+                    "timestamp_s": ts,
+                    "mode": args.mode,
+                    "case": case.case,
+                    "model": case.model,
+                    "B_local": case.b_local,
+                    "M": case.m_tokens_per_expert,
+                    "H": case.hidden_size,
+                    "F": case.ffn_size,
+                    "dtype": args.dtype,
+                    "category": "grouped_breakdown",
+                    "breakdown_parts": parts,
+                    "avg_ms": bd_ms,
+                    "tflops": bd_tflops,
+                    "over_grouped": bd_over_grouped,
+                    "allclose_vs_grouped": bd_close,
+                }
+            )
 
         if args.profile and i == args.profile_case_index:
             grouped_prof = profile_one(
@@ -510,6 +561,11 @@ def main():
                 torch_compile_fwd=args.torch_compile_fwd,
                 breakdown_parts=1,
                 row_limit=args.profile_row_limit,
+                trace_json_path=(
+                    f"{args.profile_json_prefix}.{case.case}.grouped.trace.json"
+                    if args.profile_json_prefix
+                    else ""
+                ),
             )
             loop_prof = profile_one(
                 turbo=turbo,
@@ -521,9 +577,37 @@ def main():
                 torch_compile_fwd=args.torch_compile_fwd,
                 breakdown_parts=1,
                 row_limit=args.profile_row_limit,
+                trace_json_path=(
+                    f"{args.profile_json_prefix}.{case.case}.expert_loop.trace.json"
+                    if args.profile_json_prefix
+                    else ""
+                ),
             )
             print(f"\n[PROFILE] case={case.case} impl=grouped\n{grouped_prof}")
             print(f"\n[PROFILE] case={case.case} impl=expert_loop\n{loop_prof}")
+
+            breakdown_profiles: list[tuple[int, str]] = []
+            for parts in breakdown_list:
+                if parts > case.b_local:
+                    continue
+                bd_prof = profile_one(
+                    turbo=turbo,
+                    case=case,
+                    impl_name="grouped_breakdown",
+                    device=args.device,
+                    dtype=dtype,
+                    profile_steps=args.profile_steps,
+                    torch_compile_fwd=args.torch_compile_fwd,
+                    breakdown_parts=parts,
+                    row_limit=args.profile_row_limit,
+                    trace_json_path=(
+                        f"{args.profile_json_prefix}.{case.case}.grouped_breakdown.p{parts}.trace.json"
+                        if args.profile_json_prefix
+                        else ""
+                    ),
+                )
+                breakdown_profiles.append((parts, bd_prof))
+                print(f"\n[PROFILE] case={case.case} impl=grouped_breakdown parts={parts}\n{bd_prof}")
 
             if args.profile_output_prefix:
                 grouped_path = f"{args.profile_output_prefix}.{case.case}.grouped.txt"
@@ -534,6 +618,19 @@ def main():
                     f.write(loop_prof)
                 print(f"[PROFILE] Saved: {grouped_path}")
                 print(f"[PROFILE] Saved: {loop_path}")
+                for parts, bd_prof in breakdown_profiles:
+                    bd_path = f"{args.profile_output_prefix}.{case.case}.grouped_breakdown.p{parts}.txt"
+                    with open(bd_path, "w", encoding="utf-8") as f:
+                        f.write(bd_prof)
+                    print(f"[PROFILE] Saved: {bd_path}")
+            if args.profile_json_prefix:
+                grouped_json_path = f"{args.profile_json_prefix}.{case.case}.grouped.trace.json"
+                loop_json_path = f"{args.profile_json_prefix}.{case.case}.expert_loop.trace.json"
+                print(f"[PROFILE] Saved: {grouped_json_path}")
+                print(f"[PROFILE] Saved: {loop_json_path}")
+                for parts, _ in breakdown_profiles:
+                    bd_json_path = f"{args.profile_json_prefix}.{case.case}.grouped_breakdown.p{parts}.trace.json"
+                    print(f"[PROFILE] Saved: {bd_json_path}")
 
     if args.csv:
         keys = [
@@ -546,12 +643,12 @@ def main():
             "H",
             "F",
             "dtype",
-            "grouped_avg_ms",
-            "grouped_tflops",
-            "loop_avg_ms",
-            "loop_tflops",
-            "speedup_loop_over_grouped",
-            "allclose",
+            "category",
+            "breakdown_parts",
+            "avg_ms",
+            "tflops",
+            "over_grouped",
+            "allclose_vs_grouped",
         ]
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=keys)

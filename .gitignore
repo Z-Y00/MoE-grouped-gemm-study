@@ -1,0 +1,7 @@
+rocprof_compute/
+*.json
+*.txt
+*.csv
+att*
+cache*
+.rocprofv3
